@@ -9,7 +9,6 @@ from astropy.table import Table
 from lmfit import minimize, Minimizer, Parameters, Parameter, report_fit
 import scipy.special as sc
 from scipy.interpolate import interp1d
-from scipy.optimize import least_squares
 import corner
 from astropy.cosmology import FlatLambdaCDM
 from astropy.coordinates import SkyCoord
@@ -18,6 +17,9 @@ from lmfit import Model
 from astropy.convolution.kernels import Gaussian1DKernel
 # from plot_phot_profile import *
 
+import threading
+from multiprocessing.pool import Pool
+
 from IPython.core.debugger import set_trace
 
 from scipy import interpolate
@@ -25,7 +27,7 @@ from scipy import signal
 import photutils
 from scipy.signal import peak_widths
 from scipy.signal import find_peaks
-from skimage.feature import peak_local_max
+# from skimage.feature import peak_local_max
 from scipy.signal import argrelextrema
 from astropy.table import QTable
 import matplotlib.image as mpimg
@@ -109,11 +111,11 @@ def fill_components(params_file):
             vary_dict[i]['mu_0'] = True
             vary_dict[i]['h'] = True
         if (vary_dict[i]['type'] == 'bar'):
-            vary_dict[i]['mu_0'] = True
+            vary_dict[i]['mu_0'] = False
             vary_dict[i]['r'] = False
             vary_dict[i]['h'] = False
         if (vary_dict[i]['type'] == 'ring'):
-            vary_dict[i]['mu_0'] = True
+            vary_dict[i]['mu_0'] = False
             vary_dict[i]['r'] = False
             vary_dict[i]['w'] = False
 
@@ -353,11 +355,27 @@ def fcn2min(params, components, x_kpc, data, data_err, pixsize, scale_kpc, zerop
                            psf=psf)[0]
     return (model_pix - data) / data_err
 
-def power_law(coef, xx):
-    return coef[0]*(xx-coef[2])**1.+coef[3]
-def power_law_resid(coef, xx, data):
-    return (power_law(coef, xx)-data)/(data-data[0]+0.1)
+def fcn2min_emcee(params, components, x_kpc, data, data_err, pixsize, scale_kpc, zeropoint, psf):
+    '''
+    Outputs error-normalised residuals with respect to the model to be minimised
 
+    Attributes
+    ----------
+
+    params, components, pixsize, scale_kpc, zeropoint, x_kpc, sigma_psf :
+        see make_model()
+
+    data : (float 1D array)
+        array with data values
+    data_err : (float 1D array)
+        array with error values
+
+    '''
+    model_pix = make_model(params, components, 
+                           pixsize=pixsize, scale_kpc=scale_kpc, zeropoint=zeropoint,
+                           x_kpc=x_kpc, 
+                           psf=psf)[0]
+    return -0.5*np.nansum((model_pix - data)**2./data_err**2. + np.log(2.*np.pi*data_err**2.))
 
 def fill_tbl_fit_params(tbl, params, comp_name, idx_comp, param_names):
     for name in param_names:
@@ -428,6 +446,60 @@ def export_result(objname,
     hdul = fits.HDUList([fits.PrimaryHDU(), fits.BinTableHDU(tbl)])
     hdul.writeto(fout, overwrite=True)
 
+def mcmc_fit_wrapper(args_dict):
+    print("running wrapper")
+    run_fit_mcmc(**args_dict)
+
+def fit_sample_multithread(objnames, param_arr_all,
+                           pixscale, zeropoint,
+                           iso_table_dir, psf_dir, auto_fit_res_dir, cutout_dir,
+                           dirout, plot_dir,
+                           iso_table_suf='.tab', psf_suf='-psf1d.fits', auto_fit_res_suf='_decomp.fits', cutout_suf='.jpg',
+                           correct_inclination=True, correct_dimming=True, correct_extinction=True,
+                           n_threads=1,
+                           param_colnames={"objname":"objname",
+                                           "ra":"ra",
+                                           "dec":"dec",
+                                           "z":"z"}):
+    
+    args_dict_list = []
+    for objname in objnames:
+        iso_table = Table.read(f"{iso_table_dir}/{objname}{iso_table_suf}", format='ascii')
+        psf1d = fits.open(f"{psf_dir}/{objname}{psf_suf}")[1].data
+        auto_fit_res_file = f"{auto_fit_res_dir}/{objname}{auto_fit_res_suf}"
+        auto_fit_res = fits.open(auto_fit_res_file)[1].data
+
+        pixmask = auto_fit_res["pixmask"][0]
+        r_hl = auto_fit_res["re_prof"][0]
+        components, vary_dict = fill_components(auto_fit_res_file)
+
+        obj_idx = (param_arr_all[param_colnames["objname"]] == objname).nonzero()[0]
+        ra = param_arr_all[param_colnames["ra"]][obj_idx]
+        dec = param_arr_all[param_colnames["dec"]][obj_idx]
+        z = param_arr_all[param_colnames["z"]][obj_idx]
+
+        args_dict = {
+            'iso_table':iso_table, 
+            'ra':ra, 
+            'dec':dec, 
+            'z':z, 
+            'r_hl':r_hl, 
+            'components':components, 'vary_dict':vary_dict, 'pixmask':pixmask,
+            'pixsize':pixscale, 'zeropoint':zeropoint, 
+            'psf2d':None, 'psf1d':psf1d, 'sigma_psf':None, # sigma_psf is assumed to be in arcsec
+            'dirout':dirout, 'outfname':f"{objname}_decomp_mcmc.fits", 'objname':objname, 'plot_dir':plot_dir,
+            'correct_inclination':correct_inclination, 'correct_dimming':correct_dimming, 'correct_extinction':correct_extinction,
+            'constr_arr':None,
+            'plot':True, 'cutout_file':f"{cutout_dir}/{objname}{cutout_suf}"
+        }
+
+        args_dict_list.append(args_dict)
+
+    with Pool(processes=n_threads) as pool:
+        result = pool.map(mcmc_fit_wrapper, args_dict_list)
+#        for result in result.get():
+#            print(f'Got result: {result}', flush=True)
+
 def run_fit_mcmc(iso_table, ra, dec, z, r_hl, components, vary_dict, pixmask,
                    pixsize, zeropoint, 
                    psf2d=None, psf1d=None, sigma_psf=None, # sigma_psf is assumed to be in arcsec
@@ -435,7 +507,7 @@ def run_fit_mcmc(iso_table, ra, dec, z, r_hl, components, vary_dict, pixmask,
                    correct_inclination=True, correct_dimming=True, correct_extinction=True,
                    constr_arr=None,
                    plot=False, cutout_file='./'):
-    
+    print("running")
     H = 67.4
     omega_m = 0.315
     cosmo = FlatLambdaCDM(H0=H, Om0=omega_m) 
@@ -481,14 +553,12 @@ def run_fit_mcmc(iso_table, ra, dec, z, r_hl, components, vary_dict, pixmask,
             params[f"{constr['param']}{constr['comp']}"].min = constr["win"][0]
             params[f"{constr['param']}{constr['comp']}"].max = constr["win"][1]
 
-    minner = Minimizer(fcn2min, params, fcn_args=(components, r_kpc, intens, intens_err, pixsize, scale_kpc, zeropoint, psf),
-        nan_policy='omit',burn=1000, steps=9000, thin=50,
-                      is_weighted=False, progress=True)
+    print(f"Fitting {objname}")
+    minner = Minimizer(fcn2min_emcee, params, fcn_args=(components, r_kpc, intens, intens_err, pixsize, scale_kpc, zeropoint, psf),
+        nan_policy='omit',burn=500, steps=5000, thin=25,
+                      float_behavior='posterior', progress=True)
     result = minner.minimize(method='emcee')
     result.flatchain.to_csv(f"{dirout}/{objname}_flatchain.csv")
-    emcee_plot = corner.corner(result.flatchain, labels=result.var_names,
-                               bins=10)
-    emcee_plot.savefig(f"{plot_dir}/cornerplot_{objname}.pdf")
 
     model = make_model(result.params, components, pixsize, scale_kpc, zeropoint, r_kpc, psf)
     model = make_model(result.params, components, pixsize, scale_kpc, zeropoint, r_kpc, psf, return_hr=True)
@@ -498,8 +568,14 @@ def run_fit_mcmc(iso_table, ra, dec, z, r_hl, components, vary_dict, pixmask,
                   z, r_hl, 
                   H, omega_m, ell, 
                   f"{dirout}/{outfname}.fits")
+    result.flatchain.to_csv(f"{dirout}/{objname}_flatchain.csv")
+
     if (plot):
         plot_decomposition(f"{dirout}/{outfname}.fits", cutout_file, f"{plot_dir}{objname}.pdf")
+        emcee_plot = corner.corner(result.flatchain, labels=result.var_names,
+                               bins=10)
+        emcee_plot.savefig(f"{plot_dir}/cornerplot_{objname}.pdf")
+    print(f"{objname} fitted")
     return(result)
 
 def run_fit_manual(iso_table, ra, dec, z, r_hl, components, vary_dict, pixmask,
@@ -572,138 +648,6 @@ def run_fit_manual(iso_table, ra, dec, z, r_hl, components, vary_dict, pixmask,
         plot_decomposition(f"{dirout}/{outfname}.fits", cutout_file, f"{plot_dir}{objname}.pdf")
     return(result)
 
-def run_fit_new(iso_table, ra, dec, z,
-                  pixsize, zeropoint, 
-                  psf2d=None, psf1d=None, sigma_psf=None, # sigma_psf is assumed to be in arcsec
-                  dirout='./', outfname='test', objname='test', plot_dir='./',
-                  correct_inclination=True, correct_dimming=True, correct_extinction=True,
-                  plot=False, cutout_file='./'):
-    
-    H = 67.4
-    omega_m = 0.315
-    cosmo = FlatLambdaCDM(H0=H, Om0=omega_m) 
-    scale_kpc = cosmo.angular_diameter_distance(z).value*np.pi/180./3600.*1000.
-
-    if (psf2d is not None):
-        psf = extract_psf_photutils(psf2d)
-    if (psf1d is not None):
-        psf = psf1d
-    if (sigma_psf is not None):
-        x_psf = np.arange(start=-20., stop=20., step=1.)
-        psf = gaussian(x_psf, sigma_psf/pixsize)
-    r_kpc = iso_table['sma'].data*pixsize*scale_kpc
-    mag = flx2mag(iso_table['intens'].data, zeropoint=zeropoint, scale=pixsize)
-    rel_err = iso_table['intens_err'].data/iso_table['intens'].data*2.5*np.log10(np.e)
-    ell = calc_incl_corr(iso_table['sma'].data, iso_table['ellipticity'].data, mag, mag_ell=27.)[1]
-
-    correction = 0.
-    if (correct_extinction):
-        extinction_corr = calc_extinction(ra, dec)
-        correction -= extinction_corr
-    if (correct_dimming):
-        dimming_corr = calc_dimming(float(z))
-        correction -= dimming_corr
-    if (correct_inclination):
-        inclination_corr = calc_incl_corr(iso_table['sma'].data, iso_table['ellipticity'].data, mag, mag_ell=27.)[0]
-        correction -= inclination_corr
-
-    mag += correction
-    intens = mag2flx(mag, zeropoint=zeropoint, scale=pixsize)
-    intens_err = iso_table['intens_err'].data*1.#np.sqrt(iso_table["ndata"].data)
-
-    r_kpc_in = r_kpc*1.
-    mag_in = mag*1.
-    intens_in = intens*1.
-    intens_err_in = intens_err*1.
-
-    psf_midx = find_peaks(psf)[0]
-    fwhm = peak_widths(psf, psf_midx, 0.5)[0][0]
-    psf_hwhm_idx = (r_kpc < fwhm*pixsize*scale_kpc/2.).nonzero()[0]
-    if (len(psf_hwhm_idx) != 0):
-        fit_idx_min = 2#np.max(psf_hwhm_idx)
-    else:
-        fit_idx_min = 1
-
-    #Step 0 : check if surfave brightness is constant on the end of the profile
-    # idx = np.arange(len(r_kpc)*9//10, len(r_kpc), 1)
-    # p = np.polyfit(r_kpc[idx], mag[idx], deg=2)
-    # # p_prime = np.array([3.*p[0], 2.*p[1], p[2]])
-    # p_prime = np.array([2.*p[0], p[1]])
-    # if((p[0]<0.) & (len(idx)>3)):
-    #     prof_prime = np.polyval(p_prime, r_kpc)
-    #     prof_bidx = (prof_prime < 0.001).nonzero()[0]
-    #     if (len(prof_bidx) != 0):
-    #         fit_idx_max = np.min(prof_bidx)
-    #     else:
-    #         fit_idx_max = len(r_kpc)-1
-    # else:
-    #     fit_idx_max = len(r_kpc)-1
-
-    r_kpc = r_kpc[1:]
-    mag = mag[1:]
-    # mag[0:fit_idx_min] = np.nan
-    # mag[fit_idx_max:] = np.nan
-    # intens[0:fit_idx_min] = np.nan
-    # intens[fit_idx_max:] = np.nan
-    # intens_err[0:fit_idx_min] = np.nan 
-    # intens_err[fit_idx_max:] = np.nan
-
-    # bbidx = ((r_kpc>10.) & (r_kpc<20.)).nonzero()[0]
-    # intens[bbidx] = np.nan
-
-    #Step 1 : determine half-light radius of the profile
-    flux = mag2flx(mag_in, zeropoint=zeropoint, scale=pixsize)*iso_table["ndata"]*pixsize**2
-    curve_of_growth = np.zeros(len(flux))
-    for i in range(len(flux)):
-        curve_of_growth[i]=np.sum(flux[0:i+1])
-    curve_of_growth = curve_of_growth/np.sum(flux)
-    halflight_idx = np.max((curve_of_growth < 0.5).nonzero()[0])+1
-    r_hl = r_kpc_in[halflight_idx]
-    if (r_hl > 10.):
-        r_hl = 4.
-
-    r_log = np.log10(r_kpc)
-    log_step = r_log[1]-r_log[0]
-    idx = np.arange(len(mag)).astype(int)
-    min_gap_idx = 5#np.nanmax((r_log<0.).nonzero()[0])
-    max_gap_idx = np.nanmin((mag>25.).nonzero()[0])
-    # gidx = ((idx<=min_gap_idx) | (idx>=max_gap_idx)).nonzero()[0]
-    gidx = (idx>=max_gap_idx).nonzero()[0]
-    gmag = mag[gidx]
-    gr_log = r_log[gidx]
-    res = least_squares(power_law_resid, [max(r_log)-min(r_log), 1., r_log[0], mag[0]], args=(gr_log, gmag), 
-                        # bounds=([0., 1., gr_log[0]-1., gmag[0]-1.], [+np.inf, +np.inf, gr_log[0]+1., gmag[0]+1.]),
-                        bounds=([0., 1., -np.inf, -np.inf], [+np.inf, +np.inf, np.inf, np.inf]),
-                        loss='huber')
-
-    # f = interp1d(r_log, mag, fill_value="extrapolate")
-    # rr_l = np.flip(np.arange(start=r_log[0], stop=r_log[0]-10.*log_step, step=-log_step)[1:])
-    # rr_r = np.arange(start=r_log[-1], stop=r_log[-1]+10.*log_step, step=log_step)[1:]
-    # rr = np.concatenate((rr_l, r_log, rr_r))
-    # mag_e = f(rr)
-    rr=r_log
-
-    p = np.polyfit(rr, mag, deg=3)
-
-    f = plt.figure(figsize=[7, 6])
-    ax_main = f.add_axes([0.1, 0.3, 0.8, 0.58])
-    ax_resid = f.add_axes([0.1, 0.1, 0.8, 0.175])
-
-    ax_main.set_ylim(min(30, max(mag) + 1.), np.nanmin(mag)-0.5)
-    ax_main.plot(r_log, mag, '.k')
-    ax_main.plot(r_log, power_law(res.x, r_log))
-    ax_main.plot(r_log, power_law([max(r_log)-min(r_log), 4., gr_log[0], gmag[0]], r_log))
-    ax_resid.plot(r_log, mag-power_law(res.x, r_log), '.k')
-    ax_main.axvline(r_log[min_gap_idx])
-    ax_main.axvline(r_log[max_gap_idx])
-    # ax_main.plot(rr, np.polyval(p, rr))
-    # ax_resid.plot(rr, mag-np.polyval(p, rr))
-    # p1 = np.polyder(p=p)
-    # plt.plot(rr, np.polyval(p1, rr))
-    # plt.axvline(rr_l[-1])
-    # plt.axvline(rr_r[0])
-    plt.savefig(f"{plot_dir}/{objname}_test_plot.png")
-    plt.clf()
 
 
 def run_fit(iso_table, ra, dec, z,
@@ -1057,11 +1001,7 @@ def plot_decomposition(params_file, image_file, outfname):
     ax_main = f.add_axes([0.1, 0.3, 0.5, 0.58])
     ax_resid = f.add_axes([0.1, 0.1, 0.5, 0.175])
     ax_image = f.add_axes([0.62, 0.1, 0.343, 0.8])
-
-    ax_main.set_xscale('log')
-    ax_resid.set_xscale('log')
-
-    # xlim = np.log10([0.005, np.nanmax(p["r_prof"][0])*1.1])
+    xlim = [-0.5, np.nanmax(p["r_prof"][0])*1.1]
     ax_main.plot(p["r_prof"][0], p["mag_prof"][0], '.k')
     ax_main.plot(p["r_model"][0], p["mag_model"][0])
     for i in range(len(p["mag_comps_conv"][0])):
@@ -1074,17 +1014,15 @@ def plot_decomposition(params_file, image_file, outfname):
     ax_main.fill_between(p["r_prof"][0], p["mag_prof_err_plus"][0], p["mag_prof_err_minus"][0], color='gray', alpha=0.7)
     # ax_main.fill_betweenx(y=[min(30, max(mag) + 1.), np.nanmin(mag)-0.5], x1=(r_kpc[fit_idx_max]+r_kpc[fit_idx_max])/2., x2=xlim[1], color='grey', alpha=0.5)
     ax_main.set_ylim(min(30, max(p["mag_prof"][0]) + 1.), np.nanmin(p["mag_prof"][0])-0.5)
-    # ax_main.set_xlim(xlim[0], xlim[1])
+    ax_main.set_xlim(xlim[0], xlim[1])
 
     ax_resid.plot(p["r_prof"][0], p["mag_model_pix"][0]-p["mag_prof"][0],  '.k', label='Data', zorder=0)
     ax_resid.axhline(0.0, ls='--', color='grey')
     ax_resid.set_ylim(-1, 1)
-    # ax_resid.set_xlim(xlim[0], xlim[1])
+    ax_resid.set_xlim(xlim[0], xlim[1])
     ax_resid.set_ylabel('Residuals')
     ax_resid.set_xlabel("R, kpc")
     ax_main.set_title(p["name"][0])
-    
-
     im = np.flip(mpimg.imread(image_file), axis=0)
     ax_image.imshow(im)
     ax_image.axis("off")
