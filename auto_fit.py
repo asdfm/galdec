@@ -121,7 +121,7 @@ def fill_components(params_file):
 
     return([components, vary_dict])
 
-def fill_params(components, vary_dict=None):
+def fill_params(components, vary_dict=None, log_f=None):
     params = Parameters()
     # params.add('mu_0'+str(0), value=components[0]['mu_0'], min=0)
     for i in range(0, len(components)):
@@ -158,6 +158,8 @@ def fill_params(components, vary_dict=None):
                 params.add('mu_0'+str(i),   value=components[i]['mu_0'], min=10., max=30., vary=vary_dict[i]['mu_0'])
                 params.add('r'+str(i), value=components[i]['r'], min=components[i]['r']*0.8, max=components[i]['r']*1.2, vary=vary_dict[i]['r'])
                 params.add('w'+str(i), value=components[i]['w'], min=0.1, max=3., vary=vary_dict[i]['w'])
+        if (log_f != None):
+            params.add('log_f', value=-3., min=-np.inf, max=np.inf, vary=True)
     return(params)
 
 def gaussian(x, wid, mean=0., amp=1):
@@ -333,6 +335,15 @@ def make_model(params, components,
     else:
         return [model_I_pix, model_mag_pix, mu_arr]
 
+def log_likelihood(params, components, x_kpc, data, data_err, pixsize, scale_kpc, zeropoint, psf):
+
+    model_pix = make_model(params, components,
+                           pixsize=pixsize, scale_kpc=scale_kpc, zeropoint=zeropoint,
+                           x_kpc=x_kpc, 
+                           psf=psf)[0]
+    s2 = data_err**2+model_pix**2*np.exp(2.*params['log_f'].value)
+    return -0.5*np.nansum((model_pix-data)**2/s2 + np.log(2.*np.pi*s2))
+
 def fcn2min(params, components, x_kpc, data, data_err, pixsize, scale_kpc, zeropoint, psf):
     '''
     Outputs error-normalised residuals with respect to the model to be minimised
@@ -376,6 +387,9 @@ def fcn2min_emcee(params, components, x_kpc, data, data_err, pixsize, scale_kpc,
                            x_kpc=x_kpc, 
                            psf=psf)[0]
     return -0.5*np.nansum((model_pix - data)**2./data_err**2. + np.log(2.*np.pi*data_err**2.))
+
+def fcn2min_ML(params, components, x_kpc, data, data_err, pixsize, scale_kpc, zeropoint, psf):
+    return -log_likelihood(params, components, x_kpc, data, data_err, pixsize, scale_kpc, zeropoint, psf)
 
 def fill_tbl_fit_params(tbl, params, comp_name, idx_comp, param_names):
     for name in param_names:
@@ -499,6 +513,83 @@ def fit_sample_multithread(objnames, param_arr_all,
         result = pool.map(mcmc_fit_wrapper, args_dict_list)
 #        for result in result.get():
 #            print(f'Got result: {result}', flush=True)
+
+def run_fit_ML(iso_table, ra, dec, z, r_hl, components, vary_dict, pixmask,
+                   pixsize, zeropoint, 
+                   psf2d=None, psf1d=None, sigma_psf=None, # sigma_psf is assumed to be in arcsec
+                   dirout='./', outfname='test', objname='test', plot_dir='./',
+                   correct_inclination=True, correct_dimming=True, correct_extinction=True,
+                   constr_arr=None,
+                   plot=False, cutout_file='./'):
+    print("running")
+    H = 67.4
+    omega_m = 0.315
+    cosmo = FlatLambdaCDM(H0=H, Om0=omega_m) 
+    scale_kpc = cosmo.angular_diameter_distance(z).value*np.pi/180./3600.*1000.
+
+    if (psf2d is not None):
+        psf = extract_psf_photutils(psf2d)
+    if (psf1d is not None):
+        psf = psf1d
+    if (sigma_psf is not None):
+        x_psf = np.arange(start=-20., stop=20., step=1.)
+        psf = gaussian(x_psf, sigma_psf/pixsize)
+    r_kpc = iso_table['sma'].data*pixsize*scale_kpc
+    mag = flx2mag(iso_table['intens'].data, zeropoint=zeropoint, scale=pixsize)
+    rel_err = iso_table['intens_err'].data/iso_table['intens'].data*2.5*np.log10(np.e)
+    ell = calc_incl_corr(iso_table['sma'].data, iso_table['ellipticity'].data, mag, mag_ell=27.)[1]
+    
+    correction = 0.
+    if (correct_extinction):
+        extinction_corr = calc_extinction(ra, dec)
+        correction -= extinction_corr
+    if (correct_dimming):
+        dimming_corr = calc_dimming(float(z))
+        correction -= dimming_corr
+    if (correct_inclination):
+        inclination_corr = calc_incl_corr(iso_table['sma'].data, iso_table['ellipticity'].data, mag, mag_ell=27.)[0]
+        correction -= inclination_corr
+
+    mag += correction
+    intens = mag2flx(mag, zeropoint=zeropoint, scale=pixsize)
+    intens_err = iso_table['intens_err'].data*1.#np.sqrt(iso_table["ndata"].data)
+
+    r_kpc_in = r_kpc*1.
+    mag_in = mag*1.
+    intens_in = intens*1.
+    intens_err_in = intens_err*1.
+    bdata_idx = (pixmask == 0).nonzero()[0]
+    intens[bdata_idx] = np.nan
+
+    params = fill_params(components, vary_dict)
+    if (constr_arr != None):
+        for constr in constr_arr:
+            params[f"{constr['param']}{constr['comp']}"].min = constr["win"][0]
+            params[f"{constr['param']}{constr['comp']}"].max = constr["win"][1]
+
+    print(f"Fitting {objname}")
+    minner = Minimizer(fcn2min_emcee, params, fcn_args=(components, r_kpc, intens, intens_err, pixsize, scale_kpc, zeropoint, psf),
+        nan_policy='omit')
+    
+    result = minner.minimize(method='SLSQP')
+
+    # model = make_model(result.params, components, pixsize, scale_kpc, zeropoint, r_kpc, psf)
+    model = make_model(result.params, components, pixsize, scale_kpc, zeropoint, r_kpc, psf, return_hr=True)
+    export_result(objname, 
+                  intens_in, intens_err_in, (~np.isnan(intens)).astype(int), psf, model, components, result.params, result.chisqr, result.nfree,
+                  zeropoint, pixsize, scale_kpc, 
+                  z, r_hl, 
+                  H, omega_m, ell, 
+                  f"{dirout}/{outfname}.fits")
+    # result.flatchain.to_csv(f"{dirout}/{objname}_flatchain.csv")
+
+    if (plot):
+        plot_decomposition(f"{dirout}/{outfname}.fits", cutout_file, f"{plot_dir}{objname}.pdf")
+        emcee_plot = corner.corner(result.flatchain, labels=result.var_names,
+                               bins=10)
+        emcee_plot.savefig(f"{plot_dir}/cornerplot_{objname}.pdf")
+    print(f"{objname} fitted")
+    return(result)
 
 def run_fit_mcmc(iso_table, ra, dec, z, r_hl, components, vary_dict, pixmask,
                    pixsize, zeropoint, 
