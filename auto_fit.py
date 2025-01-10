@@ -121,7 +121,7 @@ def fill_components(params_file):
 
     return([components, vary_dict])
 
-def fill_params(components, vary_dict=None, log_f=None):
+def fill_params(components, vary_dict=None, include_log_f=False):
     params = Parameters()
     # params.add('mu_0'+str(0), value=components[0]['mu_0'], min=0)
     for i in range(0, len(components)):
@@ -158,7 +158,7 @@ def fill_params(components, vary_dict=None, log_f=None):
                 params.add('mu_0'+str(i),   value=components[i]['mu_0'], min=10., max=30., vary=vary_dict[i]['mu_0'])
                 params.add('r'+str(i), value=components[i]['r'], min=components[i]['r']*0.8, max=components[i]['r']*1.2, vary=vary_dict[i]['r'])
                 params.add('w'+str(i), value=components[i]['w'], min=0.1, max=3., vary=vary_dict[i]['w'])
-        if (log_f != None):
+        if (include_log_f):
             params.add('log_f', value=-3., min=-np.inf, max=np.inf, vary=True)
     return(params)
 
@@ -414,7 +414,9 @@ def export_result(objname,
                   zeropoint, pixsize, scale_kpc,
                   z, r_hl,
                   H, omega_m, ell,
-                  fout):
+                  bic_lmfit,
+                  fout,
+                  bic=None):
     component_types = []
     for i in range(len(components)):
         component_types.append(components[i]['type'])
@@ -456,6 +458,9 @@ def export_result(objname,
     tbl.add_column(dof, name='dof')
     tbl.add_column(chisqr/dof, name='chi2/dof')
     tbl.add_column(ell, name='ellipticity')
+    tbl.add_column(bic_lmfit, name='bic_lmfit')
+    if (bic != None):
+        tbl.add_column(bic, name='bic')
 
     hdul = fits.HDUList([fits.PrimaryHDU(), fits.BinTableHDU(tbl)])
     hdul.writeto(fout, overwrite=True)
@@ -464,6 +469,11 @@ def mcmc_fit_wrapper(args_dict):
     print("running wrapper")
     run_fit_mcmc(**args_dict)
 
+def ML_fit_wrapper(args_dict):
+    print("running wrapper")
+    run_fit_ML(**args_dict)
+
+
 def fit_sample_multithread(objnames, param_arr_all,
                            pixscale, zeropoint,
                            iso_table_dir, psf_dir, auto_fit_res_dir, cutout_dir,
@@ -471,6 +481,8 @@ def fit_sample_multithread(objnames, param_arr_all,
                            iso_table_suf='.tab', psf_suf='-psf1d.fits', auto_fit_res_suf='_decomp.fits', cutout_suf='.jpg',
                            correct_inclination=True, correct_dimming=True, correct_extinction=True,
                            n_threads=1,
+                           fit_1disk=False,
+                           minimzation='emcce',
                            param_colnames={"objname":"objname",
                                            "ra":"ra",
                                            "dec":"dec",
@@ -486,6 +498,21 @@ def fit_sample_multithread(objnames, param_arr_all,
         pixmask = auto_fit_res["pixmask"][0]
         r_hl = auto_fit_res["re_prof"][0]
         components, vary_dict = fill_components(auto_fit_res_file)
+        if fit_1disk:
+            if (len(components)>2):
+                if (components[2]["type"]=='exp_disk'):
+                    components_1disk={0: components[0], 1: components[2]}
+                    vary_dict_1disk ={0: vary_dict[0], 1: vary_dict[2]}
+                    if (len(components)>3):
+                        for i in range(3, len(components)):
+                            components_1disk[i-1] = components[i]
+                            vary_dict_1disk[i-1] = vary_dict[i]
+                    components = components_1disk
+                    vary_dict = vary_dict_1disk
+                else:
+                    continue
+            else:
+                continue
 
         obj_idx = (param_arr_all[param_colnames["objname"]] == objname).nonzero()[0]
         ra = param_arr_all[param_colnames["ra"]][obj_idx]
@@ -510,7 +537,12 @@ def fit_sample_multithread(objnames, param_arr_all,
         args_dict_list.append(args_dict)
 
     with Pool(processes=n_threads) as pool:
-        result = pool.map(mcmc_fit_wrapper, args_dict_list)
+        match minimzation:
+            case 'emcee':
+                result = pool.map(mcmc_fit_wrapper, args_dict_list)
+            case 'ML':
+                result = pool.map(ML_fit_wrapper, args_dict_list)
+
 #        for result in result.get():
 #            print(f'Got result: {result}', flush=True)
 
@@ -520,6 +552,7 @@ def run_fit_ML(iso_table, ra, dec, z, r_hl, components, vary_dict, pixmask,
                    dirout='./', outfname='test', objname='test', plot_dir='./',
                    correct_inclination=True, correct_dimming=True, correct_extinction=True,
                    constr_arr=None,
+                   include_log_f=True,
                    plot=False, cutout_file='./'):
     print("running")
     H = 67.4
@@ -561,14 +594,14 @@ def run_fit_ML(iso_table, ra, dec, z, r_hl, components, vary_dict, pixmask,
     bdata_idx = (pixmask == 0).nonzero()[0]
     intens[bdata_idx] = np.nan
 
-    params = fill_params(components, vary_dict)
+    params = fill_params(components, vary_dict, log_f=True)
     if (constr_arr != None):
         for constr in constr_arr:
             params[f"{constr['param']}{constr['comp']}"].min = constr["win"][0]
             params[f"{constr['param']}{constr['comp']}"].max = constr["win"][1]
 
     print(f"Fitting {objname}")
-    minner = Minimizer(fcn2min_emcee, params, fcn_args=(components, r_kpc, intens, intens_err, pixsize, scale_kpc, zeropoint, psf),
+    minner = Minimizer(fcn2min_ML, params, fcn_args=(components, r_kpc, intens, intens_err, pixsize, scale_kpc, zeropoint, psf),
         nan_policy='omit')
     
     result = minner.minimize(method='SLSQP')
@@ -580,8 +613,8 @@ def run_fit_ML(iso_table, ra, dec, z, r_hl, components, vary_dict, pixmask,
                   zeropoint, pixsize, scale_kpc, 
                   z, r_hl, 
                   H, omega_m, ell, 
+                  result.bic,
                   f"{dirout}/{outfname}.fits")
-    # result.flatchain.to_csv(f"{dirout}/{objname}_flatchain.csv")
 
     if (plot):
         plot_decomposition(f"{dirout}/{outfname}.fits", cutout_file, f"{plot_dir}{objname}.pdf")
@@ -651,6 +684,10 @@ def run_fit_mcmc(iso_table, ra, dec, z, r_hl, components, vary_dict, pixmask,
     result = minner.minimize(method='emcee')
     result.flatchain.to_csv(f"{dirout}/{objname}_flatchain.csv")
 
+    #calculating BIC
+    log_L = fcn2min_emcee(result.params, components, r_kpc, intens, intens_err, pixsize, scale_kpc, zeropoint, psf)
+    bic = result.nvarys*np.log(result.ndata) - 2*log_L
+
     model = make_model(result.params, components, pixsize, scale_kpc, zeropoint, r_kpc, psf)
     model = make_model(result.params, components, pixsize, scale_kpc, zeropoint, r_kpc, psf, return_hr=True)
     export_result(objname, 
@@ -658,6 +695,7 @@ def run_fit_mcmc(iso_table, ra, dec, z, r_hl, components, vary_dict, pixmask,
                   zeropoint, pixsize, scale_kpc, 
                   z, r_hl, 
                   H, omega_m, ell, 
+                  result.bic,
                   f"{dirout}/{outfname}.fits")
     result.flatchain.to_csv(f"{dirout}/{objname}_flatchain.csv")
 
@@ -734,6 +772,7 @@ def run_fit_manual(iso_table, ra, dec, z, r_hl, components, vary_dict, pixmask,
                   zeropoint, pixsize, scale_kpc, 
                   z, r_hl, 
                   H, omega_m, ell,
+                  result.bic,
                   f"{dirout}/{outfname}.fits")
     if (plot):
         plot_decomposition(f"{dirout}/{outfname}.fits", cutout_file, f"{plot_dir}{objname}.pdf")
@@ -1080,6 +1119,7 @@ def run_fit(iso_table, ra, dec, z,
                   zeropoint, pixsize, scale_kpc, 
                   z, r_hl, 
                   H, omega_m, ell,
+                  result.bic,
                   f"{dirout}/{outfname}.fits")
 
     if (plot):
