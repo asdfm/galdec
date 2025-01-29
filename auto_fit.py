@@ -270,11 +270,12 @@ def calc_incl_corr(x, ell, mag, mag_ell=27.):
     # plt.clf()
     return (incl_corr, ell_interp[id_incl_corr])
 
-def calc_extinction(ra, dec, R=3.303):
+def calc_extinction(ra, dec, R=3.303, filter="g"):
     coords = SkyCoord(ra, dec, frame='icrs', unit='deg')
     csfd = CSFDQuery()
+    if (filter=="r"): R=2.285
     ebv = csfd(coords)
-    er = ebv*R# 2.285
+    er = ebv*R
     return er
 
 def calc_dimming(z):
@@ -533,6 +534,7 @@ def fit_sample_multithread(objnames, param_arr_all,
                            fit_1disk=False,
                            minimization='emcce',
                            multithread=True,
+                           filter='g',
                            param_colnames={"objname":"objname",
                                            "ra":"ra",
                                            "dec":"dec",
@@ -581,6 +583,7 @@ def fit_sample_multithread(objnames, param_arr_all,
             'dirout':dirout, 'outfname':f"{objname}_decomp_mcmc.fits", 'objname':objname, 'plot_dir':plot_dir,
             'correct_inclination':correct_inclination, 'correct_dimming':correct_dimming, 'correct_extinction':correct_extinction,
             'constr_arr':None,
+            'filter':filter,
             'plot':True, 'cutout_file':f"{cutout_dir}/{objname}{cutout_suf}"
         }
 
@@ -662,6 +665,7 @@ def fit_sample_manual(objnames, param_arr_all,
                            correct_inclination=True, correct_dimming=True, correct_extinction=True,
                            dirout_tmp=None,
                            minimization='ML',
+                           filter="g",
                            param_colnames={"objname":"objname",
                                            "ra":"ra",
                                            "dec":"dec",
@@ -673,6 +677,11 @@ def fit_sample_manual(objnames, param_arr_all,
         auto_fit_res = fits.open(auto_fit_res_file)[1].data
 
         pixmask = auto_fit_res["pixmask"][0]
+        if (len(pixmask) != len(iso_table['sma'].data)):
+            pixmask = np.zeros(len(iso_table['sma'].data))+1.
+            pixmask[:2]=0
+            pixmask[-1]=0
+
         r_hl = auto_fit_res["re_prof"][0]
         components, vary_dict = fill_components(auto_fit_res_file)
         components_ini, vary_dict_ini = deepcopy(components), deepcopy(vary_dict)
@@ -685,6 +694,7 @@ def fit_sample_manual(objnames, param_arr_all,
         if (dirout_tmp is None): dirout_tmp=dirout
 
         iterate=True
+        re_max=None
         while iterate:
             comps_add=None
             comps_del=None
@@ -694,7 +704,8 @@ def fit_sample_manual(objnames, param_arr_all,
                    psf2d=None, psf1d=psf1d, sigma_psf=None, # sigma_psf is assumed to be in arcsec
                    dirout=dirout_tmp, outfname=f"{objname}_decomp", objname=objname, plot_dir=plot_dir,
                    correct_inclination=correct_inclination, correct_dimming=correct_dimming, correct_extinction=correct_extinction,
-                   constr_arr=None,
+                #    constr_arr=None,
+                   re_max=re_max,
                    include_log_f=True,
                    plot=True, cutout_file=f"{cutout_dir}/{objname}{cutout_suf}", plot_fname="tmp")
             
@@ -712,7 +723,8 @@ def fit_sample_manual(objnames, param_arr_all,
                psf2d=None, psf1d=psf1d, sigma_psf=None, # sigma_psf is assumed to be in arcsec
                dirout=dirout, outfname=f"{objname}_decomp", objname=objname, plot_dir=plot_dir,
                correct_inclination=correct_inclination, correct_dimming=correct_dimming, correct_extinction=correct_extinction,
-               constr_arr=None,
+            #    constr_arr=None,
+               re_max=re_max,
                include_log_f=True,
                plot=True, cutout_file=f"{cutout_dir}/{objname}{cutout_suf}")
         
@@ -725,8 +737,8 @@ def run_fit_ML(iso_table, ra, dec, z, r_hl, components, vary_dict, pixmask,
                    psf2d=None, psf1d=None, sigma_psf=None, # sigma_psf is assumed to be in arcsec
                    dirout='./', outfname='test', objname='test', plot_dir='./',
                    correct_inclination=True, correct_dimming=True, correct_extinction=True,
-                   constr_arr=None,
-                   include_log_f=True,
+                   re_max=None,
+                   include_log_f=True, filter='g',
                    plot=False, cutout_file='./', plot_fname=None):
     print("running")
     H = 67.4
@@ -748,7 +760,7 @@ def run_fit_ML(iso_table, ra, dec, z, r_hl, components, vary_dict, pixmask,
     
     correction = 0.
     if (correct_extinction):
-        extinction_corr = calc_extinction(ra, dec)
+        extinction_corr = calc_extinction(ra, dec, filter=filter)
         correction -= extinction_corr
     if (correct_dimming):
         dimming_corr = calc_dimming(float(z))
@@ -769,10 +781,11 @@ def run_fit_ML(iso_table, ra, dec, z, r_hl, components, vary_dict, pixmask,
     intens[bdata_idx] = np.nan
 
     params = fill_params(components, vary_dict, include_log_f=True)
-    # if (constr_arr != None):
-    #     for constr in constr_arr:
-    #         params[f"{constr['param']}{constr['comp']}"].min = constr["win"][0]
-    #         params[f"{constr['param']}{constr['comp']}"].max = constr["win"][1]
+    if (re_max != None):
+        params["r_00"].max=re_max
+        # for constr in constr_arr:
+        #     params[f"{constr['param']}{constr['comp']}"].min = constr["win"][0]
+        #     params[f"{constr['param']}{constr['comp']}"].max = constr["win"][1]
 
     print(f"Fitting {objname}")
 
@@ -785,7 +798,8 @@ def run_fit_ML(iso_table, ra, dec, z, r_hl, components, vary_dict, pixmask,
         components_2disks = components
         vary_dict_2disks = vary_dict
         params_2disks = fill_params(components_2disks, vary_dict_2disks, include_log_f=True)   
-
+        if (re_max != None):
+            params_2disks["r_00"].max=re_max
         components_1disk={0: components[0], 1: components[2]}
         vary_dict_1disk ={0: vary_dict[0], 1: vary_dict[2]}
         if (len(components)>3):
@@ -793,7 +807,8 @@ def run_fit_ML(iso_table, ra, dec, z, r_hl, components, vary_dict, pixmask,
                 components_1disk[i-1] = components[i]
                 vary_dict_1disk[i-1] = vary_dict[i]
         params_1disk = fill_params(components_1disk, vary_dict_1disk, include_log_f=True)
-        
+        if (re_max != None):
+            params_1disk["r_00"].max=re_max
         #Fitting \w 2 disks
         minner = Minimizer(fcn2min_ML, params_2disks, fcn_args=(components_2disks, r_kpc, intens, intens_err, pixsize, scale_kpc, zeropoint, psf),
             nan_policy='omit')    
@@ -882,6 +897,7 @@ def run_fit_mcmc(iso_table, ra, dec, z, r_hl, components, vary_dict, pixmask,
                    dirout='./', outfname='test', objname='test', plot_dir='./',
                    correct_inclination=True, correct_dimming=True, correct_extinction=True,
                    constr_arr=None,
+                   filter='g',
                    plot=False, cutout_file='./'):
     print("running")
     H = 67.4
@@ -900,10 +916,10 @@ def run_fit_mcmc(iso_table, ra, dec, z, r_hl, components, vary_dict, pixmask,
     mag = flx2mag(iso_table['intens'].data, zeropoint=zeropoint, scale=pixsize)
     rel_err = iso_table['intens_err'].data/iso_table['intens'].data*2.5*np.log10(np.e)
     ell = calc_incl_corr(iso_table['sma'].data, iso_table['ellipticity'].data, mag, mag_ell=27.)[1]
-    
+
     correction = 0.
     if (correct_extinction):
-        extinction_corr = calc_extinction(ra, dec)
+        extinction_corr = calc_extinction(ra, dec, filter=filter)
         correction -= extinction_corr
     if (correct_dimming):
         dimming_corr = calc_dimming(float(z))
